@@ -1,6 +1,6 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createServer } from './server.js';
-import { ensureOutputsDir } from './managers/task-manager.js';
+import { initScheduler } from './managers/task-manager.js';
 import { ensureProjectsBase } from './managers/project-manager.js';
 import { getPool } from './db/client.js';
 
@@ -20,7 +20,9 @@ async function main(): Promise<void> {
 
   // Ensure runtime directories exist
   await ensureProjectsBase();
-  await ensureOutputsDir();
+
+  // Initialize scheduler: ensures outputs dir, resets orphaned tasks, starts pump.
+  await initScheduler();
 
   const server = createServer();
   const transport = new StdioServerTransport();

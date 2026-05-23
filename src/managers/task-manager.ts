@@ -1,78 +1,168 @@
-import { spawn } from 'child_process';
-import { mkdir, writeFile } from 'fs/promises';
+import type { ChildProcess } from 'child_process';
+import { mkdir, readFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
+import { config } from '../config.js';
 import * as queries from '../db/queries.js';
+import * as git from './git-manager.js';
+import { runClaudeCode } from './cc-runner.js';
+import type { CcRunResult } from './cc-runner.js';
 import { writeEnvFile } from './project-manager.js';
-import type { Task } from '../types.js';
+import type { Project, Task, TaskResult } from '../types.js';
 
-const PROJECTS_BASE = process.env.PROJECTS_BASE_DIR ?? join(homedir(), 'projects');
-const TASK_OUTPUTS_DIR = join(PROJECTS_BASE, '.task-outputs');
+// ─── Module state ───────────────────────────────────────────────────────────
+
+let runningCount = 0;
+const childProcesses = new Map<string, ChildProcess>();
+const timeouts = new Map<string, NodeJS.Timeout>();
+
+// ─── Directory / path helpers ─────────────────────────────────────────────────
 
 export async function ensureOutputsDir(): Promise<void> {
-  await mkdir(TASK_OUTPUTS_DIR, { recursive: true });
+  await mkdir(config.taskOutputsDir, { recursive: true });
 }
 
 function outputFilePath(taskId: string): string {
-  return join(TASK_OUTPUTS_DIR, `${taskId}.txt`);
+  return join(config.taskOutputsDir, `${taskId}.txt`);
 }
 
-async function spawnClaudeCode(
-  task: Task,
-  projectPath: string,
-  envVars: Record<string, string>,
-): Promise<void> {
-  await queries.updateTaskRunning(task.id);
+async function readRaw(taskId: string): Promise<string> {
+  try {
+    const data = await readFile(outputFilePath(taskId), 'utf-8');
+    const max = config.maxPatchBytes * 2;
+    if (data.length > max) {
+      return data.slice(data.length - max);
+    }
+    return data;
+  } catch {
+    return '';
+  }
+}
 
-  const outputPath = outputFilePath(task.id);
-  const outputChunks: Buffer[] = [];
+export async function readTaskLog(
+  taskId: string,
+  tailLines?: number,
+): Promise<string> {
+  let data: string;
+  try {
+    data = await readFile(outputFilePath(taskId), 'utf-8');
+  } catch {
+    return '';
+  }
+  const n = tailLines && tailLines > 0 ? tailLines : 200;
+  const lines = data.split('\n');
+  return lines.slice(-n).join('\n');
+}
 
-  return new Promise((resolve) => {
-    const env = {
-      ...process.env,
-      ...envVars,
-      HOME: process.env.HOME ?? homedir(),
-      PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
-    };
+// ─── Env helper ───────────────────────────────────────────────────────────────
 
-    const proc = spawn(
-      'claude',
-      ['-p', task.prompt, '--dangerously-skip-permissions'],
-      {
-        cwd: projectPath,
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
+function buildEnv(envVars: Record<string, string>): Record<string, string> {
+  const base: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === 'string') base[k] = v;
+  }
+  return {
+    ...base,
+    ...envVars,
+    HOME: process.env.HOME ?? homedir(),
+    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+  };
+}
 
-    proc.stdout.on('data', (chunk: Buffer) => outputChunks.push(chunk));
-    proc.stderr.on('data', (chunk: Buffer) => outputChunks.push(chunk));
+// ─── Scheduler ──────────────────────────────────────────────────────────────
 
-    proc.on('close', async (code) => {
-      const output = Buffer.concat(outputChunks).toString('utf-8');
-      const exitCode = code ?? 1;
+export async function initScheduler(): Promise<void> {
+  await ensureOutputsDir();
+  const reset = await queries.resetOrphanedRunningTasks();
+  if (reset > 0) {
+    console.error(`Reset ${reset} orphaned running task(s) from prior run.`);
+  }
+  runningCount = 0;
+  pump();
+}
 
-      try {
-        await writeFile(outputPath, output, 'utf-8');
-        await queries.updateTaskCompleted(task.id, exitCode, output);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await queries.updateTaskFailed(task.id, msg);
+function pump(): void {
+  while (runningCount < config.maxConcurrentTasks) {
+    runningCount++;
+    (async () => {
+      const task = await queries.claimNextQueuedTask();
+      if (!task) {
+        runningCount--;
+        return;
       }
-
-      resolve();
+      try {
+        await runTask(task);
+      } finally {
+        runningCount--;
+        pump();
+      }
+    })().catch((err) => {
+      console.error('pump worker error:', err);
     });
-
-    proc.on('error', async (err) => {
-      await queries.updateTaskFailed(task.id, err.message);
-      resolve();
-    });
-  });
+  }
 }
+
+// ─── Timeout management ───────────────────────────────────────────────────────
+
+function setupTimeout(taskId: string, child: ChildProcess): void {
+  const t = setTimeout(() => {
+    child.kill('SIGTERM');
+    setTimeout(() => child.kill('SIGKILL'), 5000);
+  }, config.taskTimeoutMs);
+  timeouts.set(taskId, t);
+}
+
+function clearTaskTimeout(taskId: string): void {
+  const t = timeouts.get(taskId);
+  if (t) {
+    clearTimeout(t);
+    timeouts.delete(taskId);
+  }
+}
+
+// ─── Message / PR helpers ─────────────────────────────────────────────────────
+
+function stripGoalPrefix(prompt: string): string {
+  if (config.goalPrefix && prompt.startsWith(config.goalPrefix)) {
+    return prompt.slice(config.goalPrefix.length);
+  }
+  return prompt;
+}
+
+function commitMessage(task: Task): string {
+  return `agents-mcp task ${task.id.slice(0, 8)}\n\n${task.prompt.slice(0, 200)}`;
+}
+
+function prTitle(task: Task): string {
+  const cleaned = stripGoalPrefix(task.prompt).trim();
+  const firstLine = cleaned.split('\n')[0].trim();
+  if (!firstLine) return `agents-mcp task ${task.id.slice(0, 8)}`;
+  return firstLine.length > 70 ? firstLine.slice(0, 70) : firstLine;
+}
+
+function prBody(task: Task, result: TaskResult): string {
+  const prompt = stripGoalPrefix(task.prompt).trim();
+  return [
+    '## Task',
+    '',
+    prompt,
+    '',
+    '## Summary',
+    '',
+    result.summary || '(no summary)',
+    '',
+    '---',
+    '',
+    'Generated by agents-mcp.',
+  ].join('\n');
+}
+
+// ─── Submit ───────────────────────────────────────────────────────────────────
 
 export async function submitTask(
   projectName: string,
   prompt: string,
+  opts?: { goalPrefix?: string },
 ): Promise<Task> {
   await ensureOutputsDir();
 
@@ -84,28 +174,258 @@ export async function submitTask(
     );
   }
 
-  const task = await queries.createTask(project.id, prompt);
-  const envVars = await queries.getEnvVars(project.id);
+  const effectivePrefix = opts?.goalPrefix ?? config.goalPrefix;
+  const fullPrompt = effectivePrefix + prompt;
 
-  // Refresh .env file before running
+  const task = await queries.createTask(project.id, fullPrompt);
+
+  // Refresh .env file before running.
+  const envVars = await queries.getEnvVars(project.id);
   if (Object.keys(envVars).length > 0) {
     await writeEnvFile(project.local_path, envVars);
   }
 
-  // Fire and forget — don't await
-  spawnClaudeCode(task, project.local_path, envVars).catch((err) => {
-    console.error(`Task ${task.id} spawn error:`, err);
-  });
-
+  pump();
   return task;
 }
 
-export function buildTaskCheckResponse(task: Task): Record<string, unknown> {
-  const isTerminal = task.status === 'completed' || task.status === 'failed';
+// ─── Core run pipeline ─────────────────────────────────────────────────────────
 
-  if (!isTerminal) {
-    const elapsed = task.started_at
-      ? Math.floor((Date.now() - new Date(task.started_at).getTime()) / 1000)
+async function runTask(task: Task): Promise<void> {
+  const project = await queries.getProjectById(task.project_id);
+  if (!project) {
+    await queries.finalizeTask(task.id, {
+      status: 'failed',
+      exit_code: null,
+      output: await readRaw(task.id),
+      result: null,
+      branch: null,
+      pr_url: null,
+      error: 'project not found',
+    });
+    return;
+  }
+
+  const envVars = await queries.getEnvVars(project.id);
+  const env = buildEnv(envVars);
+
+  const baseSha = await git.currentCommit(project.local_path);
+  const baseBranch =
+    config.baseBranchOverride ?? (await git.currentBranch(project.local_path));
+
+  const run = await runClaudeCode({
+    prompt: task.prompt,
+    cwd: project.local_path,
+    env,
+    rawOutputPath: outputFilePath(task.id),
+    onChild: (c) => {
+      childProcesses.set(task.id, c);
+      setupTimeout(task.id, c);
+    },
+  });
+
+  childProcesses.delete(task.id);
+  clearTaskTimeout(task.id);
+
+  await finalizeRun(task, project, run, baseSha, baseBranch);
+}
+
+async function finalizeRun(
+  task: Task,
+  project: Project,
+  run: CcRunResult,
+  baseSha: string | null,
+  baseBranch: string,
+): Promise<void> {
+  if (run.sessionId) {
+    await queries.setTaskSession(task.id, run.sessionId);
+  }
+
+  const needsInput =
+    !run.isError &&
+    run.subtype === 'success' &&
+    run.summary.trim().endsWith('?');
+
+  const result: TaskResult = {
+    summary: run.summary,
+    thinking: run.thinking,
+    tool_calls: run.toolCalls,
+    file_changes: null,
+    num_turns: run.numTurns,
+    cost_usd: run.costUsd,
+    duration_ms: run.durationMs,
+    subtype: run.subtype,
+  };
+
+  const rawOutput = await readRaw(task.id);
+
+  if (run.isError) {
+    await queries.finalizeTask(task.id, {
+      status: 'failed',
+      exit_code: run.exitCode,
+      output: rawOutput,
+      result,
+      branch: null,
+      pr_url: null,
+    });
+    return;
+  }
+
+  if (needsInput) {
+    // Do not open a PR for a clarifying question.
+    await queries.finalizeTask(task.id, {
+      status: 'needs_input',
+      exit_code: run.exitCode,
+      output: rawOutput,
+      result,
+      branch: null,
+      pr_url: null,
+    });
+    return;
+  }
+
+  // Success path — compute file changes and maybe open a PR.
+  const fileChanges = await git.computeFileChanges(project.local_path, baseSha);
+  result.file_changes = fileChanges;
+
+  let branch: string | null = null;
+  let prUrl: string | null = null;
+
+  if (config.autoPr && fileChanges.files.length > 0) {
+    branch = `agents-mcp/task-${task.id.slice(0, 8)}`;
+    await git.createBranch(project.local_path, branch);
+    const commitSha = await git.commitAll(project.local_path, commitMessage(task));
+    fileChanges.head_sha = commitSha;
+
+    const pushRes = await git.push(project.local_path, branch);
+    if (pushRes.ok) {
+      const pr = await git.openPr(project.local_path, {
+        branch,
+        base: baseBranch,
+        title: prTitle(task),
+        body: prBody(task, result),
+      });
+      prUrl = pr.pr_url ?? pr.compare_url;
+      if (pr.method === 'none') {
+        result.summary += `\n\n[agents-mcp] No PR created: ${pr.detail}`;
+      } else if (pr.method === 'compare') {
+        result.summary += `\n\n[agents-mcp] Could not auto-create PR via gh; open one here: ${pr.compare_url}`;
+      }
+    } else {
+      result.summary += `\n\n[agents-mcp] Push failed: ${pushRes.stderr.trim()}`;
+    }
+  }
+
+  await queries.finalizeTask(task.id, {
+    status: 'completed',
+    exit_code: run.exitCode,
+    output: rawOutput,
+    result,
+    branch,
+    pr_url: prUrl,
+  });
+}
+
+// ─── Reply (resume) flow ───────────────────────────────────────────────────────
+
+export async function replyToTask(
+  taskId: string,
+  message: string,
+): Promise<Task> {
+  const task = await queries.getTask(taskId);
+  if (!task) throw new Error(`Task "${taskId}" not found`);
+  if (!task.session_id) {
+    throw new Error('task has no session to resume');
+  }
+  if (task.status === 'running' || task.status === 'queued') {
+    throw new Error('task still in progress');
+  }
+
+  const project = await queries.getProjectById(task.project_id);
+  if (!project) throw new Error('project not found');
+
+  const envVars = await queries.getEnvVars(project.id);
+  const env = buildEnv(envVars);
+
+  const baseSha = await git.currentCommit(project.local_path);
+  const baseBranch =
+    config.baseBranchOverride ?? (await git.currentBranch(project.local_path));
+
+  await queries.markTaskRunning(task.id);
+
+  // Replies bypass the queue but still consume a slot for accounting.
+  runningCount++;
+  (async () => {
+    try {
+      const run = await runClaudeCode({
+        prompt: message,
+        cwd: project.local_path,
+        env,
+        rawOutputPath: outputFilePath(task.id),
+        resumeSessionId: task.session_id ?? undefined,
+        onChild: (c) => {
+          childProcesses.set(task.id, c);
+          setupTimeout(task.id, c);
+        },
+      });
+      childProcesses.delete(task.id);
+      clearTaskTimeout(task.id);
+      await finalizeRun(task, project, run, baseSha, baseBranch);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await queries.finalizeTask(task.id, {
+        status: 'failed',
+        exit_code: null,
+        output: await readRaw(task.id),
+        result: null,
+        branch: null,
+        pr_url: null,
+        error: msg,
+      });
+    } finally {
+      runningCount--;
+      pump();
+    }
+  })().catch((err) => {
+    console.error(`reply worker error for task ${task.id}:`, err);
+  });
+
+  const updated = await queries.getTask(taskId);
+  return updated ?? task;
+}
+
+// ─── Cancel ─────────────────────────────────────────────────────────────────
+
+export async function cancelTask(taskId: string): Promise<boolean> {
+  const child = childProcesses.get(taskId);
+  if (!child) return false;
+  child.kill('SIGTERM');
+  setTimeout(() => child.kill('SIGKILL'), 3000);
+  clearTaskTimeout(taskId);
+  await queries.finalizeTask(taskId, {
+    status: 'failed',
+    exit_code: null,
+    output: await readRaw(taskId),
+    result: null,
+    branch: null,
+    pr_url: null,
+    error: 'cancelled by user',
+  });
+  return true;
+}
+
+// ─── Status response builders ──────────────────────────────────────────────────
+
+export function buildTaskCheckResponse(task: Task): Record<string, unknown> {
+  const terminal =
+    task.status === 'completed' ||
+    task.status === 'failed' ||
+    task.status === 'needs_input';
+
+  if (!terminal) {
+    const ref = task.started_at ?? task.created_at;
+    const elapsed = ref
+      ? Math.floor((Date.now() - new Date(ref).getTime()) / 1000)
       : 0;
     return {
       ready: false,
@@ -116,15 +436,37 @@ export function buildTaskCheckResponse(task: Task): Record<string, unknown> {
     };
   }
 
-  return {
+  const base: Record<string, unknown> = {
     ready: true,
     task_id: task.id,
     status: task.status,
     exit_code: task.exit_code,
-    output: task.output,
+    session_id: task.session_id,
+    branch: task.branch,
+    pr_url: task.pr_url,
+    result: task.result,
     error: task.error,
     created_at: task.created_at,
     started_at: task.started_at,
     completed_at: task.completed_at,
+  };
+
+  if (task.status === 'needs_input') {
+    base.needs_reply = true;
+    base.question = task.result?.summary;
+  }
+
+  return base;
+}
+
+export async function getServerStatus(): Promise<Record<string, unknown>> {
+  const counts = await queries.getTaskCounts();
+  return {
+    max_concurrent: config.maxConcurrentTasks,
+    running_in_memory: runningCount,
+    running_db: counts.running,
+    queued: counts.queued,
+    capacity_free: Math.max(0, config.maxConcurrentTasks - runningCount),
+    active_task_ids: [...childProcesses.keys()],
   };
 }

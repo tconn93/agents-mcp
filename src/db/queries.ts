@@ -1,5 +1,11 @@
 import { getPool } from './client.js';
-import type { Project, Task, ProjectStatus, TaskStatus } from '../types.js';
+import type {
+  Project,
+  Task,
+  ProjectStatus,
+  TaskStatus,
+  TaskResult,
+} from '../types.js';
 
 // ─── Projects ────────────────────────────────────────────────────────────────
 
@@ -168,4 +174,108 @@ export async function listTasks(project_id?: string): Promise<Task[]> {
     'SELECT * FROM tasks ORDER BY created_at DESC',
   );
   return res.rows;
+}
+
+// ─── Scheduler / orchestration ─────────────────────────────────────────────────
+
+export async function claimNextQueuedTask(): Promise<Task | null> {
+  const pool = getPool();
+  const res = await pool.query<Task>(
+    `UPDATE tasks SET status = 'running', started_at = NOW()
+     WHERE id = (
+       SELECT id FROM tasks WHERE status = 'queued'
+       ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+     )
+     RETURNING *`,
+  );
+  return res.rows[0] ?? null;
+}
+
+export async function setTaskSession(
+  id: string,
+  session_id: string,
+): Promise<void> {
+  const pool = getPool();
+  await pool.query('UPDATE tasks SET session_id = $1 WHERE id = $2', [
+    session_id,
+    id,
+  ]);
+}
+
+export interface FinalizeTaskFields {
+  status: TaskStatus;
+  exit_code: number | null;
+  output: string;
+  result: TaskResult | null;
+  branch: string | null;
+  pr_url: string | null;
+  error?: string;
+}
+
+export async function finalizeTask(
+  id: string,
+  fields: FinalizeTaskFields,
+): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE tasks
+     SET status = $1,
+         exit_code = $2,
+         output = $3,
+         result = $4::jsonb,
+         branch = $5,
+         pr_url = $6,
+         error = $7,
+         completed_at = NOW()
+     WHERE id = $8`,
+    [
+      fields.status,
+      fields.exit_code,
+      fields.output,
+      fields.result ? JSON.stringify(fields.result) : null,
+      fields.branch,
+      fields.pr_url,
+      fields.error ?? null,
+      id,
+    ],
+  );
+}
+
+export async function markTaskRunning(id: string): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `UPDATE tasks
+     SET status = 'running', started_at = COALESCE(started_at, NOW())
+     WHERE id = $1`,
+    [id],
+  );
+}
+
+export async function resetOrphanedRunningTasks(): Promise<number> {
+  const pool = getPool();
+  const res = await pool.query(
+    `UPDATE tasks
+     SET status = 'failed', error = 'orphaned by server restart', completed_at = NOW()
+     WHERE status = 'running'`,
+  );
+  return res.rowCount ?? 0;
+}
+
+export async function getTaskCounts(): Promise<{
+  queued: number;
+  running: number;
+}> {
+  const pool = getPool();
+  const res = await pool.query<{ status: string; count: string }>(
+    `SELECT status, COUNT(*) AS count FROM tasks
+     WHERE status IN ('queued', 'running')
+     GROUP BY status`,
+  );
+  let queued = 0;
+  let running = 0;
+  for (const row of res.rows) {
+    if (row.status === 'queued') queued = Number(row.count);
+    else if (row.status === 'running') running = Number(row.count);
+  }
+  return { queued, running };
 }

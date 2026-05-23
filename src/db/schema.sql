@@ -32,3 +32,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   started_at TIMESTAMPTZ,
   completed_at TIMESTAMPTZ
 );
+
+-- Idempotent column additions so existing DBs evolve
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS session_id TEXT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result JSONB;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS branch TEXT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pr_url TEXT;
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
