@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
 import { mkdir, writeFile } from 'fs/promises';
-import { join, homedir } from 'path';
+import { join } from 'path';
+import { homedir } from 'os';
 import * as queries from '../db/queries.js';
 import { writeEnvFile } from './project-manager.js';
 import type { Task } from '../types.js';

@@ -6,8 +6,9 @@ import { getPool } from './db/client.js';
 
 // Load .env if present (dev convenience)
 try {
-  const { config } = await import('dotenv');
-  config();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const dotenv = await import('dotenv' as any);
+  dotenv.config();
 } catch {
   // dotenv not installed; rely on real env vars
 }
